@@ -71,6 +71,11 @@ memory:
   `config.yaml` or the plugin directory.
 - Never store secret values in the Vault itself.
 
+## Other clients
+
+Claude Code/Desktop, Cursor, VS Code, Codex CLI, Gemini CLI, Docker MCP
+Toolkit: see **[docs/clients.md](docs/clients.md)** for copy-paste configs.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
