@@ -1,0 +1,7 @@
+name: perseus-vault
+version: 1.0.0
+description: "Perseus Vault — shared MCP memory server (Mneme): FTS5 + semantic recall, corrections, journaling, cross-instance shared memory."
+pip_dependencies:
+  - mcp
+requires_env:
+  - PERSEUS_VAULT_MCP_TOKEN
