@@ -32,6 +32,18 @@ _PREVIEW_CAP = 400
 _SESSION_CAPTURE_MAX_CHARS = 8000
 _TURN_BUFFER_CAP = 40
 
+# Per-Vault-call timeout used on the *synchronous* prefetch (cache-miss) path.
+# _build_recall_block makes two sequential recall calls (recall_when + recall),
+# and the client serializes them on a single asyncio lock, so the wall-clock
+# cost is roughly 2x this value. The host (MemoryManager._prefetch_provider)
+# runs prefetch() inside a thread it join()s with an ~8s budget, so the sum
+# MUST stay comfortably under that or the whole block is dropped as "timed
+# out" and startup memory silently fails to surface (issue #753). 3s x 2 = 6s
+# worst case leaves headroom. The background warm path (queue_prefetch) can
+# afford to be more patient.
+_SYNC_CALL_TIMEOUT = 3.0
+_WARM_CALL_TIMEOUT = 15.0
+
 # ---------------------------------------------------------------------------
 # Tool schemas
 # ---------------------------------------------------------------------------
@@ -201,7 +213,7 @@ class PerseusVaultProvider(MemoryProvider):
             return
 
         def _work() -> None:
-            block = self._build_recall_block(query)
+            block = self._build_recall_block(query, call_timeout=_WARM_CALL_TIMEOUT)
             with self._prefetch_lock:
                 self._prefetched = block
 
@@ -209,12 +221,32 @@ class PerseusVaultProvider(MemoryProvider):
                          name="perseus-vault-prefetch").start()
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        # Fast path: consume a block warmed by a prior queue_prefetch().
         with self._prefetch_lock:
             block = self._prefetched
             self._prefetched = ""
-        return block
+        if block:
+            return block
 
-    def _build_recall_block(self, query: str) -> str:
+        # Cache-miss path (issue #753): on a FRESH session, queue_prefetch()
+        # has never run, so there is nothing warmed for turn 1 — the exact
+        # moment "startup memory surfacing" is expected. The same miss happens
+        # when the background warm from the previous turn hasn't landed yet.
+        # The host runs this call inside a timed worker thread, so a bounded
+        # synchronous recall here is safe and is what makes startup memory
+        # actually appear instead of silently returning "". Timeouts are kept
+        # tight (_SYNC_CALL_TIMEOUT) so the two serialized Vault calls fit
+        # inside the host's prefetch budget.
+        if not self._enabled or not self._client or not query.strip():
+            return ""
+        try:
+            return self._build_recall_block(query, call_timeout=_SYNC_CALL_TIMEOUT)
+        except Exception as e:  # never let a recall hiccup break the turn
+            logger.debug("perseus-vault: synchronous prefetch failed: %s", e)
+            return ""
+
+    def _build_recall_block(self, query: str, *,
+                            call_timeout: float = _WARM_CALL_TIMEOUT) -> str:
         items: List[Dict[str, Any]] = []
         seen: set = set()
 
@@ -224,7 +256,7 @@ class PerseusVaultProvider(MemoryProvider):
         # 1) Triggered memories (recall_when) — declared 'recall in this situation'
         res = self._client.call_tool(
             "perseus_vault_recall_when",
-            {"context": query, "limit": 4, **ws_args}, timeout=15)
+            {"context": query, "limit": 4, **ws_args}, timeout=call_timeout)
         for it in self._extract_items(res):
             if it.get("id") not in seen:
                 seen.add(it.get("id"))
@@ -234,7 +266,7 @@ class PerseusVaultProvider(MemoryProvider):
         res = self._client.call_tool(
             "perseus_vault_recall",
             {"query": query, "limit": _PREFETCH_LIMIT,
-             "preview_cap": _PREVIEW_CAP, **ws_args}, timeout=15)
+             "preview_cap": _PREVIEW_CAP, **ws_args}, timeout=call_timeout)
         for it in self._extract_items(res):
             if it.get("id") not in seen:
                 seen.add(it.get("id"))
