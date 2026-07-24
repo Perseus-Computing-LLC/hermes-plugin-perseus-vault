@@ -1,7 +1,7 @@
 # Perseus Vault memory provider for Hermes Agent
 
 Connects [Hermes Agent](https://github.com/NousResearch/hermes-agent) to a
-remote **Perseus Vault** (Mneme) MCP server as its external memory provider.
+remote **Perseus Vault** MCP server as its external memory provider.
 
 One Vault can be shared by many Hermes instances (workstations, cloud agents,
 cron workers) so durable context — facts, decisions, corrections, ops notes —
