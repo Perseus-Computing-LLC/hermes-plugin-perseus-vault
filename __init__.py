@@ -1,6 +1,6 @@
 """Perseus Vault memory plugin — MemoryProvider interface.
 
-Cross-session memory backed by a remote Perseus Vault (Mneme) MCP server:
+Cross-session memory backed by a remote Perseus Vault MCP server:
 FTS5 + dense semantic recall, correction tracking, decision journaling, and
 bi-temporal fact history. One Vault can be shared by many Hermes instances
 (Cloud, Desktop, cron workers) so context follows the user between machines.
