@@ -23,7 +23,7 @@ follows you between machines and sessions.
 ## Requirements
 
 - A reachable Perseus Vault MCP endpoint and a bearer token for it.
-  (Run your own [Mneme](https://github.com/Perseus-Computing-LLC) server or
+  (Run your own [Perseus Vault](https://github.com/Perseus-Computing-LLC/perseus-vault) server or
   use a hosted Vault.)
 - The `mcp` Python package — installed automatically during
   `hermes memory setup` (declared in `plugin.yaml`).
