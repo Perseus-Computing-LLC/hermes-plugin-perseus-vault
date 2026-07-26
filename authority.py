@@ -22,13 +22,13 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_URL = "https://vault.perseus.observer/message"
 _TERMINAL_READ_ONLY = re.compile(
-    r"^\s*(?:git\s+(?:status|diff|log|show|branch|remote|rev-parse)\b|"
-    r"(?:pwd|date|whoami|id|uname|df|du|ps)\b)", re.I,
+    r"^\s*(?:git\s+(?:status|rev-parse)\b|"
+    r"(?:pwd|whoami|id|uname|df|du|ps)\b)", re.I,
 )
 # A read-only-looking prefix does not make the rest of a shell program safe.
 # Compound operators, command substitution, redirects, and newlines force the
 # command through authority enforcement instead of the read-only fast path.
-_SHELL_COMPOUND = re.compile(r"(?:&&|\|\||[;|`<>]|\$\(|[\r\n])")
+_SHELL_COMPOUND = re.compile(r"(?:&&|\|\||[;&|`<>]|\$\(|[\r\n])")
 _TERMINAL_RULES = (
     (re.compile(r"\bgit\s+push\b", re.I), "git_push"),
     (re.compile(r"\b(?:gh\s+pr\s+merge|pulls?/\d+/merge)\b", re.I), "pull_request_merge"),
@@ -138,6 +138,9 @@ def _result_failed(result: Any) -> bool:
         return False
     if value.get("success") is False:
         return True
+    exit_code = value.get("exit_code")
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0:
+        return True
     error = value.get("error")
     return bool(error) if isinstance(error, (str, list, dict)) else error is not None
 
@@ -200,12 +203,22 @@ class AuthorityEnforcer:
         invariant, not merely error handling.
         """
         mode = self.mode
-        # Hermes execution middleware is fail-open when a callback raises before
-        # next_call(). Keep the entire enforcement prelude inside this boundary.
+        # Classification is pure and total under normal operation. Read-only/off
+        # pass-through must happen outside the security catch so a tool exception
+        # propagates exactly once instead of being mistaken for preflight failure.
         try:
             capability = _classify(tool_name, args if isinstance(args, dict) else {})
-            if mode == "off" or capability is None:
+        except BaseException as exc:
+            logger.warning("perseus-vault authority classification failed: %s", exc)
+            if mode == "shadow":
                 return next_call(args)
+            return json.dumps({"error": f"Vault authority blocked tool execution: {exc}"})
+        if mode == "off" or capability is None:
+            return next_call(args)
+
+        # Hermes execution middleware is fail-open when a callback raises before
+        # next_call(). Keep the remaining enforcement prelude inside this boundary.
+        try:
             correlation = self._correlation(kwargs)
             agent_id, workspace, scope, external_ref = self._identity()
             if not all((agent_id, scope, external_ref)):
@@ -271,11 +284,14 @@ class AuthorityEnforcer:
                 execution_result = result
                 execution_finished = True
             except BaseException as exc:
-                self._call("perseus_vault_action_complete", {
-                    "action_id": action_id, "actor_agent_id": agent_id,
-                    "outcome": "failed",
-                    "outcome_hash": _canonical_digest({"exception_type": type(exc).__name__}),
-                })
+                try:
+                    self._call("perseus_vault_action_complete", {
+                        "action_id": action_id, "actor_agent_id": agent_id,
+                        "outcome": "failed",
+                        "outcome_hash": _canonical_digest({"exception_type": type(exc).__name__}),
+                    })
+                except Exception as lifecycle_exc:
+                    logger.error("perseus-vault failed to record tool exception: %s", lifecycle_exc)
                 raise
 
             failed = _result_failed(result)
@@ -290,6 +306,10 @@ class AuthorityEnforcer:
             logger.warning("perseus-vault authority middleware %s %s: %s",
                            "observed failure after" if execution_started else "blocked before",
                            capability, exc)
+            # Once the real tool starts, its exception is the authoritative tool
+            # outcome. Lifecycle recording must never replace or swallow it.
+            if execution_started and not execution_finished:
+                raise
             if mode == "shadow":
                 # Shadow observes but never changes whether or what the tool executes.
                 if execution_finished:
