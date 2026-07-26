@@ -19,6 +19,10 @@ follows you between machines and sessions.
 - **Explicit tools** — `perseus_remember`, `perseus_recall`, `perseus_forget`.
 - **Resilient transport** — one persistent streamable-HTTP MCP session on a
   background thread; reconnects transparently on transport errors.
+- **Authorized Action Receipts (optional)** — in shadow or enforcement mode,
+  Hermes tool calls are checked against a Vault authority manifest before
+  side effects run. The plugin records hash-only intent/outcome evidence,
+  Vault-backed approvals, and short-lived execution leases.
 
 ## Requirements
 
@@ -54,6 +58,11 @@ Resolution order: environment variables → `config.yaml` `memory.perseus-vault:
 | `PERSEUS_VAULT_MCP_TOKEN` | Bearer token (**required**) | — |
 | `PERSEUS_VAULT_URL` | MCP endpoint URL | `https://vault.perseus.observer/message` |
 | `PERSEUS_VAULT_WORKSPACE` | Workspace scope hash | global / unscoped |
+| `PERSEUS_VAULT_AUTHORITY_MODE` | AAR policy: `off`, `shadow`, or fail-closed `enforce` | `off` |
+| `PERSEUS_VAULT_AGENT_ID` | Registered Vault agent identity used by authority manifests | — |
+| `PERSEUS_VAULT_AUTHORITY_SCOPE` | Trusted scope anchor, e.g. `github:Org/repo` (auto-detected from `origin` when possible) | — |
+| `PERSEUS_VAULT_AUTHORITY_EXTERNAL_REF` | External system reference checked against manifest prefixes | scope anchor |
+| `PERSEUS_VAULT_APPROVER_PRINCIPAL` | Vault principal allowed to record approval events | — |
 
 `config.yaml` equivalent:
 
@@ -70,6 +79,13 @@ memory:
 - The token is read from the environment or `.env` — never hardcode it in
   `config.yaml` or the plugin directory.
 - Never store secret values in the Vault itself.
+- AAR sends only trusted identifiers and SHA-256 digests to durable action
+  records. Raw commands, tool arguments, results, credentials, and client
+  metadata are never written as evidence.
+- Start with `PERSEUS_VAULT_AUTHORITY_MODE=shadow`. Switch to `enforce` only
+  after creating an active authority manifest for the configured agent and
+  workspace. Enforcement blocks unknown tools and any missing, revoked,
+  expired, capability-mismatched, or scope-mismatched authority.
 
 ## Other clients
 
