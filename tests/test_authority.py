@@ -129,6 +129,89 @@ class AuthorityE2ETest(unittest.TestCase):
             os.chdir(original_cwd)
         self.assertIn("blocked", json.loads(result)["error"].lower())
 
+    def test_background_and_mutating_git_commands_are_authorized(self):
+        commands = (
+            "git status & rm -rf /tmp/pwned",
+            "git branch -D main",
+            "git branch -m old new",
+            "git remote add evil https://example.test/repo",
+            "git remote set-url origin https://example.test/repo",
+        )
+        for index, command in enumerate(commands):
+            with self.subTest(command=command):
+                vault = FakeVault(deny=True)
+                gate = self.enforcer(vault)
+                result = gate.execution_middleware(
+                    "terminal", {"command": command},
+                    lambda args: self.fail("shell mutation bypassed authority"),
+                    tool_call_id=f"tc-mutating-{index}",
+                )
+                self.assertIn("blocked", json.loads(result)["error"].lower())
+                self.assertEqual(vault.calls[0][0], "perseus_vault_action_intent")
+
+    def test_read_only_passthrough_exception_executes_once_and_propagates(self):
+        for mode in ("shadow", "enforce"):
+            with self.subTest(mode=mode):
+                os.environ["PERSEUS_VAULT_AUTHORITY_MODE"] = mode
+                gate = self.enforcer(FakeVault())
+                calls = []
+                def fail_once(args):
+                    calls.append(args)
+                    raise RuntimeError("tool failed")
+                with self.assertRaisesRegex(RuntimeError, "tool failed"):
+                    gate.execution_middleware(
+                        "terminal", {"command": "git status"}, fail_once,
+                        tool_call_id=f"tc-read-error-{mode}",
+                    )
+                self.assertEqual(len(calls), 1)
+
+    def test_shadow_propagates_tool_exception_after_execution_started(self):
+        os.environ["PERSEUS_VAULT_AUTHORITY_MODE"] = "shadow"
+        gate = self.enforcer(FakeVault())
+        calls = []
+        def fail_once(args):
+            calls.append(args)
+            raise RuntimeError("side effect failed")
+        with self.assertRaisesRegex(RuntimeError, "side effect failed"):
+            gate.execution_middleware(
+                "write_file", {"path": "x", "content": "y"}, fail_once,
+                tool_call_id="tc-shadow-error",
+            )
+        self.assertEqual(len(calls), 1)
+
+    def test_nonzero_terminal_exit_is_recorded_as_failure(self):
+        vault = FakeVault()
+        gate = self.enforcer(vault)
+        result = gate.execution_middleware(
+            "terminal", {"command": "printf failure"},
+            lambda args: json.dumps({"output": "failure", "exit_code": 1}),
+            tool_call_id="tc-exit-1",
+        )
+        self.assertEqual(json.loads(result)["exit_code"], 1)
+        completion = next(args for name, args in vault.calls if name.endswith("action_complete"))
+        self.assertEqual(completion["outcome"], "failed")
+
+    def test_read_like_commands_with_mutating_options_are_authorized(self):
+        commands = (
+            "git diff --output=/tmp/victim",
+            "git diff -o /tmp/victim",
+            "git show --output=/tmp/victim HEAD",
+            "git log -o /tmp/victim",
+            "date -s tomorrow",
+            "date --set=tomorrow",
+        )
+        for index, command in enumerate(commands):
+            with self.subTest(command=command):
+                vault = FakeVault(deny=True)
+                gate = self.enforcer(vault)
+                result = gate.execution_middleware(
+                    "terminal", {"command": command},
+                    lambda args: self.fail("mutating option bypassed authority"),
+                    tool_call_id=f"tc-option-{index}",
+                )
+                self.assertIn("blocked", json.loads(result)["error"].lower())
+                self.assertEqual(vault.calls[0][0], "perseus_vault_action_intent")
+
     def test_unknown_revoked_or_mismatched_authority_blocks(self):
         gate = self.enforcer(FakeVault(deny=True))
         result = gate.execution_middleware(
