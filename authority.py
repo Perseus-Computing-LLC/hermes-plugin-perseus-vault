@@ -22,9 +22,13 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_URL = "https://vault.perseus.observer/message"
 _TERMINAL_READ_ONLY = re.compile(
-    r"^\s*(?:git\s+(?:status|diff|log|show|branch|remote|rev-parse|fetch)\b|"
-    r"(?:pwd|date|whoami|id|uname|df|du|ps|env|printenv)\b)", re.I,
+    r"^\s*(?:git\s+(?:status|diff|log|show|branch|remote|rev-parse)\b|"
+    r"(?:pwd|date|whoami|id|uname|df|du|ps)\b)", re.I,
 )
+# A read-only-looking prefix does not make the rest of a shell program safe.
+# Compound operators, command substitution, redirects, and newlines force the
+# command through authority enforcement instead of the read-only fast path.
+_SHELL_COMPOUND = re.compile(r"(?:&&|\|\||[;|`<>]|\$\(|[\r\n])")
 _TERMINAL_RULES = (
     (re.compile(r"\bgit\s+push\b", re.I), "git_push"),
     (re.compile(r"\b(?:gh\s+pr\s+merge|pulls?/\d+/merge)\b", re.I), "pull_request_merge"),
@@ -107,7 +111,7 @@ def _classify(tool_name: str, args: Dict[str, Any]) -> Optional[str]:
             logger.warning("perseus-vault: invalid authority tool capability JSON")
     if tool_name == "terminal":
         command = str(args.get("command") or "")
-        if _TERMINAL_READ_ONLY.search(command):
+        if not _SHELL_COMPOUND.search(command) and _TERMINAL_READ_ONLY.search(command):
             return None
         for pattern, capability in _TERMINAL_RULES:
             if pattern.search(command):
@@ -120,6 +124,22 @@ def _classify(tool_name: str, args: Dict[str, Any]) -> Optional[str]:
     # Unknown tools are safe in compatibility/shadow mode, but enforcement is
     # deliberately fail-closed because the plugin cannot prove they are reads.
     return "unknown_tool_side_effect"
+
+
+def _result_failed(result: Any) -> bool:
+    """Conservatively recognize structured tool failures without false positives."""
+    value = result
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return False
+    if not isinstance(value, dict):
+        return False
+    if value.get("success") is False:
+        return True
+    error = value.get("error")
+    return bool(error) if isinstance(error, (str, list, dict)) else error is not None
 
 
 class AuthorityEnforcer:
@@ -180,20 +200,27 @@ class AuthorityEnforcer:
         invariant, not merely error handling.
         """
         mode = self.mode
-        capability = _classify(tool_name, args if isinstance(args, dict) else {})
-        if mode == "off" or capability is None:
-            return next_call(args)
-        correlation = self._correlation(kwargs)
-        agent_id, workspace, scope, external_ref = self._identity()
-        if not all((agent_id, scope, external_ref)):
-            message = "Vault authority identity/scope is not configured"
-            if mode == "shadow":
-                logger.warning("perseus-vault shadow: %s", message)
+        # Hermes execution middleware is fail-open when a callback raises before
+        # next_call(). Keep the entire enforcement prelude inside this boundary.
+        try:
+            capability = _classify(tool_name, args if isinstance(args, dict) else {})
+            if mode == "off" or capability is None:
                 return next_call(args)
-            return json.dumps({"error": message})
+            correlation = self._correlation(kwargs)
+            agent_id, workspace, scope, external_ref = self._identity()
+            if not all((agent_id, scope, external_ref)):
+                raise RuntimeError("Vault authority identity/scope is not configured")
+        except BaseException as exc:
+            logger.warning("perseus-vault authority preflight failed: %s", exc)
+            if mode == "shadow":
+                return next_call(args)
+            return json.dumps({"error": f"Vault authority blocked tool execution: {exc}"})
 
         action: Optional[Dict[str, Any]] = None
         lease_id = ""
+        execution_started = False
+        execution_finished = False
+        execution_result: Any = None
         holder_id = f"hermes:{agent_id}:{correlation}"
         try:
             action = self._call("perseus_vault_action_intent", {
@@ -232,14 +259,17 @@ class AuthorityEnforcer:
                     raise RuntimeError("Vault did not record a granted approval reference")
 
             lease = self._call("perseus_vault_action_lease_acquire", {
-                "action_id": action_id, "holder_id": holder_id, "ttl_seconds": 300,
+                "action_id": action_id, "holder_id": holder_id, "ttl_seconds": 900,
             })
             lease_id = str(lease.get("id") or "")
             if not lease_id:
                 raise RuntimeError("Vault returned no execution lease")
 
             try:
+                execution_started = True
                 result = next_call(args)
+                execution_result = result
+                execution_finished = True
             except BaseException as exc:
                 self._call("perseus_vault_action_complete", {
                     "action_id": action_id, "actor_agent_id": agent_id,
@@ -248,8 +278,7 @@ class AuthorityEnforcer:
                 })
                 raise
 
-            source = str(result)
-            failed = bool(re.search(r'"(?:error|success)"\s*:\s*(?:"|false)', source, re.I))
+            failed = _result_failed(result)
             receipt = self._call("perseus_vault_action_complete", {
                 "action_id": action_id, "actor_agent_id": agent_id,
                 "outcome": "failed" if failed else "executed",
@@ -258,9 +287,15 @@ class AuthorityEnforcer:
             logger.debug("perseus-vault action receipt finalized: %s", receipt.get("id", action_id))
             return result
         except BaseException as exc:
-            logger.warning("perseus-vault authority middleware blocked %s: %s", capability, exc)
-            if mode == "shadow" and action is None:
-                return next_call(args)
+            logger.warning("perseus-vault authority middleware %s %s: %s",
+                           "observed failure after" if execution_started else "blocked before",
+                           capability, exc)
+            if mode == "shadow":
+                # Shadow observes but never changes whether or what the tool executes.
+                if execution_finished:
+                    return execution_result
+                if not execution_started:
+                    return next_call(args)
             return json.dumps({"error": f"Vault authority blocked {capability}: {exc}"})
         finally:
             if lease_id:

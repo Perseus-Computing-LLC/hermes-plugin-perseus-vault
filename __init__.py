@@ -544,4 +544,8 @@ class PerseusVaultProvider(MemoryProvider):
 # ---------------------------------------------------------------------------
 
 def register(ctx) -> None:
+    # Exclusive memory-provider discovery supplies a collector whose hook methods
+    # are no-ops. Register directly with the host middleware registry here, before
+    # provider initialization (whose exceptions Hermes intentionally swallows).
+    activate_runtime_hooks()
     ctx.register_memory_provider(PerseusVaultProvider())
