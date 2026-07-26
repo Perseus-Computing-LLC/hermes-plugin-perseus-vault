@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 from agent.memory_provider import MemoryProvider
 
 from .client import VaultMCPClient
+from .authority import activate_runtime_hooks
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +173,9 @@ class PerseusVaultProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
         self._agent_context = kwargs.get("agent_context", "primary")
+        # AAR hooks must be installed before this session can execute tools.
+        # In enforce mode activation errors are fatal rather than fail-open.
+        activate_runtime_hooks()
         self._workspace_hash = self._resolve(
             "PERSEUS_VAULT_WORKSPACE", "workspace_hash")
         try:
