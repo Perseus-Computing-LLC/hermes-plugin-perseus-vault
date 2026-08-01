@@ -23,6 +23,10 @@ follows you between machines and sessions.
   Hermes tool calls are checked against a Vault authority manifest before
   side effects run. The plugin records hash-only intent/outcome evidence,
   Vault-backed approvals, and short-lived execution leases.
+- **Resource-bound constraints** — opted-in capabilities bind the concrete
+  repository, deployment environment, destination, or payment merchant/amount/
+  currency/expiry to the intent and approval. Retargeting and bound expansion
+  fail closed before execution. See `docs/resource-constraints-contract.md`.
 
 ## Requirements
 
