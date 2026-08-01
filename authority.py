@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from .client import VaultMCPClient
+from .constraints import ResourceConstraints, compare, constraints_from_tool, durable_projection
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +224,8 @@ class AuthorityEnforcer:
             agent_id, workspace, scope, external_ref = self._identity()
             if not all((agent_id, scope, external_ref)):
                 raise RuntimeError("Vault authority identity/scope is not configured")
+            resource_constraints = constraints_from_tool(tool_name, args, capability, scope)
+            resource_constraints.validate_for(capability)
         except BaseException as exc:
             logger.warning("perseus-vault authority preflight failed: %s", exc)
             if mode == "shadow":
@@ -242,11 +245,20 @@ class AuthorityEnforcer:
                 "capability": capability,
                 "action_key": f"hermes:{capability}:{correlation}",
                 "intent_hash": _canonical_digest({"tool": tool_name, "args": args}),
+                "resource_constraints": resource_constraints.canonical(),
+                "resource_constraints_json": json.dumps(resource_constraints.canonical(), sort_keys=True, separators=(",", ":")),
+                "resource_constraints_hash": resource_constraints.digest(),
             })
+            action_constraints = ResourceConstraints.from_mapping(action.get("resource_constraints"))
+            allowed, reason = compare(resource_constraints, action_constraints)
+            if not allowed:
+                raise RuntimeError(reason)
             action_id = str(action.get("id") or "")
             if not action_id:
                 raise RuntimeError("Vault returned no action id")
 
+            if capability == "payment" and not action.get("approval_required"):
+                raise RuntimeError("payment capability requires an approval-bound authority manifest")
             if action.get("approval_required"):
                 from tools.approval import request_tool_approval
                 decision = request_tool_approval(
@@ -270,6 +282,10 @@ class AuthorityEnforcer:
                     })
                 if approval.get("status") != "approval_granted" or not approval.get("approval_ref"):
                     raise RuntimeError("Vault did not record a granted approval reference")
+                approved_constraints = ResourceConstraints.from_mapping(approval.get("resource_constraints"))
+                allowed, reason = compare(resource_constraints, approved_constraints)
+                if not allowed:
+                    raise RuntimeError(reason)
 
             lease = self._call("perseus_vault_action_lease_acquire", {
                 "action_id": action_id, "holder_id": holder_id, "ttl_seconds": 900,
@@ -299,6 +315,8 @@ class AuthorityEnforcer:
                 "action_id": action_id, "actor_agent_id": agent_id,
                 "outcome": "failed" if failed else "executed",
                 "outcome_hash": _canonical_digest({"result": result}),
+                "resource_constraints_hash": resource_constraints.digest(),
+                "resource_constraints": durable_projection(resource_constraints),
             })
             logger.debug("perseus-vault action receipt finalized: %s", receipt.get("id", action_id))
             return result

@@ -36,9 +36,12 @@ class FakeVault:
             return {"ok": False, "text": "capability is not permitted", "data": None}
         if name.endswith("action_intent"):
             payload = {"id": "act-test", "approval_required": self.approval_required,
-                       "status": "approval_requested" if self.approval_required else "intent"}
+                       "status": "approval_requested" if self.approval_required else "intent",
+                       "resource_constraints": args.get("resource_constraints")}
         elif name.endswith("action_approve"):
-            payload = {"id": "act-test", "status": "approval_granted", "approval_ref": "apr-test"}
+            intent = next((value for tool, value in reversed(self.calls) if tool.endswith("action_intent")), {})
+            payload = {"id": "act-test", "status": "approval_granted", "approval_ref": "apr-test",
+                       "resource_constraints": intent.get("resource_constraints")}
         elif name.endswith("action_lease_acquire"):
             payload = {"id": "lease-test"}
         elif name.endswith("action_complete"):
@@ -333,6 +336,36 @@ class AuthorityE2ETest(unittest.TestCase):
         files = [p for p in Path(self.tmp.name).rglob("*") if p.is_file()]
         self.assertEqual(files, [])
         self.assertNotIn(sentinel, json.dumps(vault.calls))
+
+    def test_resource_constraints_bind_git_repository_before_execution(self):
+        vault = FakeVault()
+        gate = self.enforcer(vault)
+        executed = []
+        result = gate.execution_middleware(
+            "terminal", {"command": "git push origin main", "resource_ref": "github:Org/repo"},
+            lambda args: executed.append(args) or json.dumps({"success": True}),
+            tool_call_id="tc-resource",
+        )
+        self.assertEqual(json.loads(result), {"success": True})
+        intent = vault.calls[0][1]
+        self.assertEqual(intent["resource_constraints"]["resource_ref"], "github:Org/repo")
+        self.assertEqual(len(intent["resource_constraints_hash"]), 64)
+        completion = next(args for name, args in vault.calls if name.endswith("action_complete"))
+        self.assertEqual(set(completion["resource_constraints"]), {"resource_constraints_version", "resource_constraints_hash"})
+
+    def test_payment_constraints_retarget_or_amount_increase_block_before_execution(self):
+        for args in (
+            {"merchant_ref": "merchant-a", "amount_minor": 2000, "currency": "USD", "expires_at": "2030-01-01T00:00:00Z"},
+            {"merchant_ref": "merchant-b", "amount_minor": 2000, "currency": "USD", "expires_at": "2030-01-01T00:00:00Z"},
+        ):
+            vault = FakeVault(approval_required=False)
+            gate = self.enforcer(vault)
+            with patch.object(authority, "_classify", return_value="payment"):
+                result = gate.execution_middleware(
+                    "payment", args, lambda value: self.fail("payment executed without a bound approval"),
+                    tool_call_id="tc-payment",
+                )
+            self.assertIn("blocked", json.loads(result)["error"].lower())
 
 
 if __name__ == "__main__":
