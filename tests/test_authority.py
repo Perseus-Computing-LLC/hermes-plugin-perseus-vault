@@ -14,7 +14,7 @@ _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 _PACKAGE = "perseus_vault_test_plugin"
 package = types.ModuleType(_PACKAGE)
 package.__path__ = [str(_PLUGIN_ROOT)]
-sys.modules.setdefault(_PACKAGE, package)
+sys.modules[_PACKAGE] = package
 spec = importlib.util.spec_from_file_location(
     f"{_PACKAGE}.authority", _PLUGIN_ROOT / "authority.py"
 )
@@ -96,6 +96,41 @@ class AuthorityE2ETest(unittest.TestCase):
         intent = vault.calls[0][1]
         self.assertEqual(len(intent["intent_hash"]), 64)
         self.assertNotIn("command", intent)
+
+    def test_context_projection_digest_is_bound_to_intent_lease_and_completion(self):
+        vault = FakeVault()
+        gate = self.enforcer(vault)
+        projection = {
+            "schema_version": "perseus-evidence-control/v1",
+            "source_refs": [{"id": "source-1", "content_hash": "a" * 64}],
+            "selection_digest": "b" * 64,
+            "contract_digest": "c" * 64,
+            "decision": "allow",
+            "reason_codes": ["evidence_in_scope"],
+            "stage_refs": [],
+            "sensitive_payload": "not_captured",
+        }
+        result = gate.execution_middleware(
+            "write_file", {"path": "x"}, lambda args: "ok",
+            tool_call_id="tc-context", context_projection=projection,
+        )
+        self.assertEqual(result, "ok")
+        expected = authority._canonical_digest(projection)
+        for name, args in vault.calls:
+            if name.endswith(("action_intent", "action_lease_acquire", "action_complete")):
+                self.assertEqual(args.get("context_selection_digest"), expected)
+
+    def test_non_executable_context_decisions_block_before_side_effect(self):
+        gate = self.enforcer(FakeVault())
+        for decision in ("abstain", "interrupt"):
+            with self.subTest(decision=decision):
+                result = gate.execution_middleware(
+                    "write_file", {"path": "x"},
+                    lambda args: self.fail("non-executable decision bypassed gate"),
+                    tool_call_id=f"tc-{decision}",
+                    context_projection={"decision": decision},
+                )
+                self.assertIn("blocked", json.loads(result)["error"].lower())
 
     def test_chained_read_only_prefix_is_still_authorized(self):
         chained = (
@@ -366,6 +401,40 @@ class AuthorityE2ETest(unittest.TestCase):
                     tool_call_id="tc-payment",
                 )
             self.assertIn("blocked", json.loads(result)["error"].lower())
+
+    def test_lease_acquire_failure_blocks_execution(self):
+        class LeaseDeniedVault(FakeVault):
+            def call_tool(self, name, args, timeout=None):
+                if name.endswith("action_lease_acquire"):
+                    self.calls.append((name, args))
+                    return {"ok": False, "text": "lease denied: action not approved", "data": None}
+                return super().call_tool(name, args, timeout)
+
+        gate = self.enforcer(LeaseDeniedVault())
+        result = gate.execution_middleware(
+            "terminal", {"command": "git push origin main"},
+            lambda args: self.fail("executed without a valid lease"),
+            tool_call_id="tc-lease-denied",
+        )
+        payload = json.loads(result)
+        self.assertIn("blocked", payload["error"].lower())
+
+    def test_action_complete_without_lease_never_called(self):
+        class LeaseDeniedVault(FakeVault):
+            def call_tool(self, name, args, timeout=None):
+                if name.endswith("action_lease_acquire"):
+                    self.calls.append((name, args))
+                    return {"ok": False, "text": "lease denied", "data": None}
+                return super().call_tool(name, args, timeout)
+
+        gate = self.enforcer(LeaseDeniedVault())
+        gate.execution_middleware(
+            "write_file", {"path": "x", "content": "y"},
+            lambda args: self.fail("executed without a valid lease"),
+            tool_call_id="tc-no-complete",
+        )
+        names = [name for name, _ in LeaseDeniedVault().calls]
+        self.assertNotIn("perseus_vault_action_complete", names)
 
 
 if __name__ == "__main__":

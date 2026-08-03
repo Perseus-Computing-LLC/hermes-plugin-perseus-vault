@@ -16,8 +16,12 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from .client import VaultMCPClient
-from .constraints import ResourceConstraints, compare, constraints_from_tool, durable_projection
+if __package__:
+    from .client import VaultMCPClient
+    from .constraints import ResourceConstraints, compare, constraints_from_tool, durable_projection
+else:  # Standalone checkout/import used by plugin discovery and test runners.
+    from client import VaultMCPClient
+    from constraints import ResourceConstraints, compare, constraints_from_tool, durable_projection
 
 logger = logging.getLogger(__name__)
 
@@ -239,7 +243,7 @@ class AuthorityEnforcer:
         execution_result: Any = None
         holder_id = f"hermes:{agent_id}:{correlation}"
         try:
-            action = self._call("perseus_vault_action_intent", {
+            intent_args: Dict[str, Any] = {
                 "agent_id": agent_id, "workspace_hash": workspace,
                 "scope_anchor": scope, "external_ref": external_ref,
                 "capability": capability,
@@ -248,14 +252,28 @@ class AuthorityEnforcer:
                 "resource_constraints": resource_constraints.canonical(),
                 "resource_constraints_json": json.dumps(resource_constraints.canonical(), sort_keys=True, separators=(",", ":")),
                 "resource_constraints_hash": resource_constraints.digest(),
-            })
+            }
+            context_projection = kwargs.get("context_projection")
+            if context_projection is not None:
+                if not isinstance(context_projection, dict):
+                    raise RuntimeError("context projection is not an object")
+                if context_projection.get("decision") not in {"allow", "constrain", "interrupt", "recover", "abstain"}:
+                    raise RuntimeError("context projection has an invalid decision")
+                context_digest = _canonical_digest(context_projection)
+                if context_projection.get("decision") in {"interrupt", "abstain"}:
+                    raise RuntimeError("context decision does not authorize action")
+            else:
+                context_digest = None
+            if context_digest:
+                intent_args["context_selection_digest"] = context_digest
+            action = self._call("perseus_vault_action_intent", intent_args)
+            action_id = str(action.get("id") or "")
+            if not action_id:
+                raise RuntimeError("Vault returned no action id")
             action_constraints = ResourceConstraints.from_mapping(action.get("resource_constraints"))
             allowed, reason = compare(resource_constraints, action_constraints)
             if not allowed:
                 raise RuntimeError(reason)
-            action_id = str(action.get("id") or "")
-            if not action_id:
-                raise RuntimeError("Vault returned no action id")
 
             if capability == "payment" and not action.get("approval_required"):
                 raise RuntimeError("payment capability requires an approval-bound authority manifest")
@@ -287,9 +305,12 @@ class AuthorityEnforcer:
                 if not allowed:
                     raise RuntimeError(reason)
 
-            lease = self._call("perseus_vault_action_lease_acquire", {
+            lease_args = {
                 "action_id": action_id, "holder_id": holder_id, "ttl_seconds": 900,
-            })
+            }
+            if context_digest:
+                lease_args["context_selection_digest"] = context_digest
+            lease = self._call("perseus_vault_action_lease_acquire", lease_args)
             lease_id = str(lease.get("id") or "")
             if not lease_id:
                 raise RuntimeError("Vault returned no execution lease")
@@ -311,13 +332,16 @@ class AuthorityEnforcer:
                 raise
 
             failed = _result_failed(result)
-            receipt = self._call("perseus_vault_action_complete", {
+            completion_args = {
                 "action_id": action_id, "actor_agent_id": agent_id,
                 "outcome": "failed" if failed else "executed",
                 "outcome_hash": _canonical_digest({"result": result}),
                 "resource_constraints_hash": resource_constraints.digest(),
                 "resource_constraints": durable_projection(resource_constraints),
-            })
+            }
+            if context_digest:
+                completion_args["context_selection_digest"] = context_digest
+            receipt = self._call("perseus_vault_action_complete", completion_args)
             logger.debug("perseus-vault action receipt finalized: %s", receipt.get("id", action_id))
             return result
         except BaseException as exc:
