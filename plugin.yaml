@@ -5,3 +5,6 @@ pip_dependencies:
   - mcp
 requires_env:
   - PERSEUS_VAULT_MCP_TOKEN
+kind: standalone
+provides_hooks:
+  - tool_execution

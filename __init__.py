@@ -18,12 +18,137 @@ import json
 import logging
 import os
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.memory_provider import MemoryProvider
 
-from .client import VaultMCPClient
-from .authority import activate_runtime_hooks
+if __package__:
+    from .client import VaultMCPClient
+    from .authority import activate_runtime_hooks
+else:  # Standalone checkout/import used by plugin discovery and test runners.
+    from client import VaultMCPClient
+    from authority import activate_runtime_hooks
+
+
+EVIDENCE_CONTROL_SCHEMA = "perseus-evidence-control/v1"
+EVIDENCE_DECISIONS = {"allow", "constrain", "interrupt", "recover", "abstain"}
+_SHA256_HEX = set("0123456789abcdef")
+
+
+def _evidence_digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def build_context_decision_projection(
+    selected_sources: List[Dict[str, Any]],
+    *,
+    decision: str,
+    reason_codes: List[str],
+    stage_refs: List[str],
+    contract_fields: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return the hash-only context projection used by downstream receipts."""
+    sources = [dict(source) for source in selected_sources]
+    selection_digest = _evidence_digest(sources)
+    contract = dict(contract_fields or {})
+    contract.update({
+        "schema_version": EVIDENCE_CONTROL_SCHEMA,
+        "source_refs": sources,
+        "selection_digest": selection_digest,
+        "decision": decision,
+        "reason_codes": list(reason_codes),
+        "stage_refs": list(stage_refs),
+        "sensitive_payload": "not_captured",
+    })
+    return {
+        "schema_version": EVIDENCE_CONTROL_SCHEMA,
+        "source_refs": sources,
+        "selection_digest": selection_digest,
+        "contract_digest": _evidence_digest(contract),
+        "decision": decision,
+        "reason_codes": list(reason_codes),
+        "stage_refs": list(stage_refs),
+        "sensitive_payload": "not_captured",
+    }
+
+
+def derive_context_decision(
+    source_refs: List[Dict[str, Any]],
+    *,
+    workspace_scope: str = "",
+    require_provenance: bool = True,
+) -> Tuple[str, List[str]]:
+    """Classify selected evidence without treating empty/ambiguous recall as allow."""
+    if not source_refs:
+        return "abstain", ["missing_evidence"]
+    if any(source.get("timeout") is True for source in source_refs):
+        return "abstain", ["context_timeout"]
+    if any(source.get("evidence_sufficient") is False for source in source_refs):
+        return "abstain", ["insufficient_evidence"]
+    if require_provenance:
+        required = {"id", "content_hash", "valid_from", "valid_to", "recorded_at", "scope", "trust_class"}
+        if any(not required.issubset(source) for source in source_refs):
+            return "abstain", ["missing_provenance"]
+    status = {source.get("evidence_status") for source in source_refs}
+    if status & {"stale", "superseded", "contradictory", "conflicting"}:
+        value = "contradictory_evidence" if status & {"contradictory", "conflicting"} else "stale_evidence"
+        return "recover", [value, "refresh_or_resolve_evidence"]
+    if workspace_scope and any(source.get("scope") != workspace_scope for source in source_refs):
+        return "constrain", ["scope_mismatch", "revalidate_before_action"]
+    if any(source.get("trust_class") in {"untrusted", "unknown", "quarantined"} for source in source_refs):
+        return "constrain", ["untrusted_evidence", "isolate_non_authoritative_context"]
+    return "allow", ["evidence_in_scope"]
+
+
+def validate_context_decision_projection(projection: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    errors: List[str] = []
+    if projection.get("schema_version") != EVIDENCE_CONTROL_SCHEMA:
+        errors.append("schema_version")
+    if projection.get("decision") not in EVIDENCE_DECISIONS:
+        errors.append("decision")
+    if projection.get("sensitive_payload") != "not_captured":
+        errors.append("sensitive_payload")
+    sources = projection.get("source_refs")
+    if not isinstance(sources, list):
+        errors.append("source_refs")
+        sources = []
+    for index, source in enumerate(sources):
+        for field in ("id", "content_hash", "valid_from", "valid_to", "recorded_at", "scope", "trust_class"):
+            if field not in source:
+                errors.append(f"source_refs[{index}].{field}")
+        digest = source.get("content_hash")
+        if not isinstance(digest, str) or len(digest) != 64 or set(digest.lower()) - _SHA256_HEX:
+            errors.append(f"source_refs[{index}].content_hash")
+        if isinstance(source.get("valid_from"), (int, float)) and isinstance(source.get("valid_to"), (int, float)) and source["valid_to"] < source["valid_from"]:
+            errors.append(f"source_refs[{index}].valid_interval")
+        if any(key in source for key in ("content", "body", "body_json", "prompt", "context", "arguments", "secret", "token")):
+            errors.append(f"source_refs[{index}].raw_payload")
+    if projection.get("selection_digest") != _evidence_digest(sources):
+        errors.append("selection_digest")
+    contract = {
+        "schema_version": EVIDENCE_CONTROL_SCHEMA,
+        "source_refs": sources,
+        "selection_digest": projection.get("selection_digest"),
+        "decision": projection.get("decision"),
+        "reason_codes": projection.get("reason_codes"),
+        "stage_refs": projection.get("stage_refs"),
+        "sensitive_payload": "not_captured",
+    }
+    if projection.get("contract_digest") != _evidence_digest(contract):
+        errors.append("contract_digest")
+    if projection.get("decision") == "allow" and not sources:
+        errors.append("allow_requires_source_refs")
+    if not isinstance(projection.get("reason_codes"), list) or not projection["reason_codes"]:
+        errors.append("reason_codes")
+    if not isinstance(projection.get("stage_refs"), list):
+        errors.append("stage_refs")
+    forbidden = {"prompt", "context", "content", "body", "body_json", "arguments", "tool_arguments", "response", "secret", "token"}
+    for key in projection:
+        if str(key).lower() in forbidden or str(key).lower().startswith("raw_"):
+            errors.append(f"forbidden_field:{key}")
+    return not errors, sorted(set(errors))
 
 logger = logging.getLogger(__name__)
 
@@ -290,6 +415,32 @@ class PerseusVaultProvider(MemoryProvider):
         if len(lines) == 1:
             return ""
         return "\n".join(lines)
+
+    def context_decision_projection(
+        self,
+        selected_sources: List[Dict[str, Any]],
+        *,
+        decision: Optional[str] = None,
+        reason_codes: Optional[List[str]] = None,
+        stage_refs: Optional[List[str]] = None,
+        require_provenance: bool = True,
+    ) -> Dict[str, Any]:
+        """Expose the machine-readable selection projection without changing rendering."""
+        derived_decision, derived_reasons = derive_context_decision(
+            selected_sources,
+            workspace_scope=self._workspace_hash,
+            require_provenance=require_provenance,
+        )
+        projection = build_context_decision_projection(
+            selected_sources,
+            decision=decision or derived_decision,
+            reason_codes=reason_codes or derived_reasons,
+            stage_refs=stage_refs or [],
+        )
+        valid, errors = validate_context_decision_projection(projection)
+        if not valid:
+            raise ValueError("invalid context decision projection: " + ", ".join(errors))
+        return projection
 
     @staticmethod
     def _extract_items(res: Dict[str, Any]) -> List[Dict[str, Any]]:
