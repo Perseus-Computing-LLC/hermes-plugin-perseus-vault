@@ -11,6 +11,10 @@ follows you between machines and sessions.
 
 - **Prefetch recall** — before each turn, relevant Vault memories
   (`recall_when` triggers + keyword recall) are injected as context.
+- **Lifecycle-safe prefetch** — warmed context is bound in memory to its
+  generation, session, workspace, query, and source identities. Forget/removal,
+  session changes, provider initialization, shutdown, and in-flight invalidation
+  discard stale warm results before they can be consumed.
 - **Session distillation** — at session end, the transcript is distilled into
   durable Vault entities (primary sessions only; cron/subagent contexts are
   excluded so they don't pollute shared memory).
@@ -51,6 +55,19 @@ hermes memory status    # should show perseus-vault ← active, "available ✓"
 ```
 
 Start a new session after setup — providers initialize at agent startup.
+
+### Freshness boundary
+
+A successful `perseus_forget` or built-in-memory removal prevents the forgotten
+source from being returned by future provider prefetch. The provider cannot
+retract tokens already delivered to a model; the host must cancel or recover an
+already-composed turn according to its normal interruption policy.
+
+The lifecycle capability surface (`lifecycle_capabilities()`, a provider-local
+extension method) reports addressed forget and prefetch invalidation as
+supported. Semantic rejection, supersession, and derived artifact invalidation
+are explicitly reported as unsupported until the mounted Vault/provider
+contract supplies those operations.
 
 ## Configuration
 
