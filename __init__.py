@@ -682,15 +682,20 @@ class PerseusVaultProvider(MemoryProvider):
             self._source_revision += 1
             self._prefetched = None
 
-    def _invalidate_builtin_target(self, target: str) -> None:
-        """Invalidate the source currently mirrored for a built-in target."""
+    def _invalidate_builtin_target(
+        self, target: str, fallback_key: str = ""
+    ) -> Tuple[str, ...]:
+        """Invalidate tracked and host-reported sources for a built-in target."""
         with self._prefetch_lock:
-            keys = self._builtin_source_keys.pop(target, set())
+            keys = set(self._builtin_source_keys.pop(target, set()))
+            if fallback_key:
+                keys.add(fallback_key)
             self._source_revision += 1
             for key in keys:
                 epoch_key = ("category-key", "hermes-memory", key)
                 self._source_epochs[epoch_key] = self._source_epochs.get(epoch_key, 0) + 1
             self._prefetched = None
+            return tuple(sorted(keys))
 
     def _remember_builtin_source_key(self, target: str, key: str) -> None:
         with self._prefetch_lock:
@@ -852,14 +857,15 @@ class PerseusVaultProvider(MemoryProvider):
         elif action == "remove":
             if not content:
                 return
-            with self._prefetch_lock:
-                keys = list(self._builtin_source_keys.get(target, set()))
+            digest = hashlib.sha1(content.encode()).hexdigest()[:8]
+            fallback_key = f"builtin-{target}-{digest}"
+            keys = self._invalidate_builtin_target(target, fallback_key)
             for key in keys:
                 self._client.call_tool("perseus_vault_forget", {
                     "category": category, "key": key,
                     "reason": "removed from built-in memory",
                 }, timeout=15)
-            self._invalidate_builtin_target(target)
+
 
     # ------------------------------------------------------------------
     # Tools

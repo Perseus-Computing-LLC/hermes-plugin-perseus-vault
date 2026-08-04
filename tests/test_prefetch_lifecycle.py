@@ -421,9 +421,14 @@ class PrefetchLifecycleTests(unittest.TestCase):
             [
                 call("perseus_vault_forget", {
                     "category": "hermes-memory",
-                    "key": "builtin-MEMORY.md-abc12345",
+                    "key": key,
                     "reason": "removed from built-in memory",
-                }, timeout=15),
+                }, timeout=15)
+                for key in sorted({
+                    "builtin-MEMORY.md-abc12345",
+                    "builtin-MEMORY.md-"
+                    + hashlib.sha1(b"old content").hexdigest()[:8],
+                })
             ],
         )
         provider._client.call_tool.reset_mock()
