@@ -243,6 +243,7 @@ class PerseusVaultProvider(MemoryProvider):
         self._agent_context: str = "primary"
         self._workspace_hash: str = ""
         self._prefetched: str = ""
+        self._prefetch_generation: int = 0
         self._prefetch_lock = threading.Lock()
         self._turn_buffer: List[Dict[str, str]] = []
         self._enabled = False
@@ -342,12 +343,30 @@ class PerseusVaultProvider(MemoryProvider):
             return
 
         def _work() -> None:
-            block = self._build_recall_block(query, call_timeout=_WARM_CALL_TIMEOUT)
             with self._prefetch_lock:
-                self._prefetched = block
+                generation = self._prefetch_generation
+            block = self._build_recall_block(query, call_timeout=_WARM_CALL_TIMEOUT)
+            self.store_prefetched(block, generation=generation)
 
         threading.Thread(target=_work, daemon=True,
                          name="perseus-vault-prefetch").start()
+
+    def prefetch_generation(self) -> int:
+        """Return the generation of the currently valid warmed context."""
+        with self._prefetch_lock:
+            return self._prefetch_generation
+
+    def invalidate_prefetch(self) -> None:
+        """Discard warmed context and advance its invalidation generation."""
+        with self._prefetch_lock:
+            self._prefetch_generation += 1
+            self._prefetched = ""
+
+    def store_prefetched(self, block: str, *, generation: int) -> None:
+        """Publish a warm result only if no invalidation happened meanwhile."""
+        with self._prefetch_lock:
+            if generation == self._prefetch_generation:
+                self._prefetched = block
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         # Fast path: consume a block warmed by a prior queue_prefetch().
@@ -561,6 +580,7 @@ class PerseusVaultProvider(MemoryProvider):
                 "category": category, "key": key,
                 "reason": "removed from built-in memory",
             }, timeout=15)
+            self.invalidate_prefetch()
 
     # ------------------------------------------------------------------
     # Tools
@@ -634,6 +654,7 @@ class PerseusVaultProvider(MemoryProvider):
             res = self._client.call_tool("perseus_vault_forget", {
                 "category": category, "key": key, **ws_args,
             }, timeout=15)
+            self.invalidate_prefetch()
             return json.dumps({"success": res.get("ok", False),
                                "result": res.get("text", "")[:400]})
 
