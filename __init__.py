@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import threading
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.memory_provider import MemoryProvider
@@ -33,6 +34,25 @@ else:  # Standalone checkout/import used by plugin discovery and test runners.
 EVIDENCE_CONTROL_SCHEMA = "perseus-evidence-control/v1"
 EVIDENCE_DECISIONS = {"allow", "constrain", "interrupt", "recover", "abstain"}
 _SHA256_HEX = set("0123456789abcdef")
+LIFECYCLE_CONTROL_SCHEMA = "perseus-memory-lifecycle/v1"
+
+
+@dataclass(frozen=True)
+class _RecallResult:
+    block: str
+    source_refs: Tuple[Tuple[str, str, str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class _PrefetchEntry:
+    block: str
+    generation: int
+    session_id: str
+    principal: str
+    query_digest: str
+    workspace_hash: str
+    source_refs: Tuple[Tuple[str, str, str, str], ...]
+    source_epochs: Tuple[int, ...]
 
 
 def _evidence_digest(value: Any) -> str:
@@ -241,9 +261,11 @@ class PerseusVaultProvider(MemoryProvider):
         self._client: Optional[VaultMCPClient] = None
         self._session_id: str = ""
         self._agent_context: str = "primary"
+        self._principal: str = ""
         self._workspace_hash: str = ""
-        self._prefetched: str = ""
+        self._prefetched: Optional[_PrefetchEntry] = None
         self._prefetch_generation: int = 0
+        self._source_epochs: Dict[Tuple[str, str, str], int] = {}
         self._prefetch_lock = threading.Lock()
         self._turn_buffer: List[Dict[str, str]] = []
         self._enabled = False
@@ -297,13 +319,21 @@ class PerseusVaultProvider(MemoryProvider):
         return True
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        self.invalidate_prefetch()
         self._session_id = session_id
         self._agent_context = kwargs.get("agent_context", "primary")
-        # AAR hooks must be installed before this session can execute tools.
-        # In enforce mode activation errors are fatal rather than fail-open.
-        activate_runtime_hooks()
+        self._principal = str(
+            kwargs.get("user_id")
+            or kwargs.get("user_id_alt")
+            or kwargs.get("agent_identity")
+            or ""
+        )
         self._workspace_hash = self._resolve(
             "PERSEUS_VAULT_WORKSPACE", "workspace_hash")
+        # AAR hooks must be installed after the full session identity is bound,
+        # so hook callbacks cannot observe the previous workspace.
+        # In enforce mode activation errors are fatal rather than fail-open.
+        activate_runtime_hooks()
         try:
             self._client = VaultMCPClient(self._url(), self._token())
             self._client.start()
@@ -314,6 +344,7 @@ class PerseusVaultProvider(MemoryProvider):
             self._enabled = False
 
     def shutdown(self) -> None:
+        self.invalidate_prefetch()
         if self._client:
             try:
                 self._client.stop()
@@ -338,15 +369,43 @@ class PerseusVaultProvider(MemoryProvider):
             "Never store secret values in the Vault."
         )
 
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs,
+    ) -> None:
+        """Rotate session identity and discard context warmed for its predecessor."""
+        del parent_session_id, kwargs
+        self._session_id = new_session_id
+        if reset or rewound:
+            self._turn_buffer.clear()
+        self.invalidate_prefetch()
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if not self._enabled or not self._client or not query.strip():
             return
 
+        with self._prefetch_lock:
+            generation = self._prefetch_generation
+            session = session_id or self._session_id
+            principal = self._principal
+            workspace_hash = self._workspace_hash
+        query_digest = _evidence_digest(query)
+
         def _work() -> None:
-            with self._prefetch_lock:
-                generation = self._prefetch_generation
-            block = self._build_recall_block(query, call_timeout=_WARM_CALL_TIMEOUT)
-            self.store_prefetched(block, generation=generation)
+            result = self._build_recall_block(query, call_timeout=_WARM_CALL_TIMEOUT)
+            self.store_prefetched(
+                result,
+                generation=generation,
+                session_id=session,
+                principal=principal,
+                query_digest=query_digest,
+                workspace_hash=workspace_hash,
+            )
 
         threading.Thread(target=_work, daemon=True,
                          name="perseus-vault-prefetch").start()
@@ -360,21 +419,63 @@ class PerseusVaultProvider(MemoryProvider):
         """Discard warmed context and advance its invalidation generation."""
         with self._prefetch_lock:
             self._prefetch_generation += 1
-            self._prefetched = ""
+            self._prefetched = None
 
-    def store_prefetched(self, block: str, *, generation: int) -> None:
+    def store_prefetched(
+        self,
+        result: _RecallResult | str,
+        *,
+        generation: int,
+        session_id: str = "",
+        principal: str = "",
+        query_digest: str = "",
+        workspace_hash: str = "",
+    ) -> None:
         """Publish a warm result only if no invalidation happened meanwhile."""
+        if isinstance(result, str):
+            result = _RecallResult(result)
         with self._prefetch_lock:
             if generation == self._prefetch_generation:
-                self._prefetched = block
+                entry = _PrefetchEntry(
+                    block=result.block,
+                    generation=generation,
+                    session_id=session_id,
+                    principal=principal,
+                    query_digest=query_digest,
+                    workspace_hash=workspace_hash,
+                    source_refs=result.source_refs,
+                    source_epochs=tuple(
+                        self._source_epochs.get(self._source_epoch_key(ref), 0)
+                        for ref in result.source_refs
+                    ),
+                )
+                self._prefetched = entry
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         # Fast path: consume a block warmed by a prior queue_prefetch().
+        session = session_id or self._session_id
+        principal = self._principal
+        query_digest = _evidence_digest(query)
         with self._prefetch_lock:
-            block = self._prefetched
-            self._prefetched = ""
-        if block:
-            return block
+            entry = self._prefetched
+            workspace_hash = self._workspace_hash
+            generation = self._prefetch_generation
+            source_epochs = tuple(
+                self._source_epochs.get(self._source_epoch_key(ref), 0)
+                for ref in entry.source_refs
+            ) if entry else ()
+            if entry and self._prefetch_entry_matches(
+                entry,
+                generation=generation,
+                session=session,
+                principal=principal,
+                query_digest=query_digest,
+                workspace_hash=workspace_hash,
+                source_epochs=source_epochs,
+            ):
+                self._prefetched = None
+                return entry.block
+            self._prefetched = None
 
         # Cache-miss path (issue #753): on a FRESH session, queue_prefetch()
         # has never run, so there is nothing warmed for turn 1 — the exact
@@ -387,19 +488,57 @@ class PerseusVaultProvider(MemoryProvider):
         # inside the host's prefetch budget.
         if not self._enabled or not self._client or not query.strip():
             return ""
+        with self._prefetch_lock:
+            recall_generation = self._prefetch_generation
+            recall_session = self._session_id
+            recall_principal = self._principal
+            recall_workspace_hash = self._workspace_hash
         try:
-            return self._build_recall_block(query, call_timeout=_SYNC_CALL_TIMEOUT)
+            result = self._build_recall_block(
+                query, call_timeout=_SYNC_CALL_TIMEOUT
+            )
+            with self._prefetch_lock:
+                if (
+                    recall_generation != self._prefetch_generation
+                    or recall_session != self._session_id
+                    or recall_principal != self._principal
+                    or recall_workspace_hash != self._workspace_hash
+                ):
+                    return ""
+            return result.block
         except Exception as e:  # never let a recall hiccup break the turn
             logger.debug("perseus-vault: synchronous prefetch failed: %s", e)
             return ""
 
+    @staticmethod
+    def _prefetch_entry_matches(
+        entry: _PrefetchEntry,
+        *,
+        generation: int,
+        session: str,
+        principal: str,
+        query_digest: str,
+        workspace_hash: str,
+        source_epochs: Tuple[int, ...],
+    ) -> bool:
+        return (
+            entry.generation == generation
+            and entry.session_id == session
+            and entry.principal == principal
+            and entry.query_digest == query_digest
+            and entry.workspace_hash == workspace_hash
+            and entry.source_epochs == source_epochs
+        )
+
     def _build_recall_block(self, query: str, *,
-                            call_timeout: float = _WARM_CALL_TIMEOUT) -> str:
+                            call_timeout: float = _WARM_CALL_TIMEOUT) -> _RecallResult:
         items: List[Dict[str, Any]] = []
         seen: set = set()
 
-        ws_args = ({"workspace_hash": self._workspace_hash}
-                   if self._workspace_hash else {})
+        with self._prefetch_lock:
+            workspace_hash = self._workspace_hash
+        ws_args = ({"workspace_hash": workspace_hash}
+                   if workspace_hash else {})
 
         # 1) Triggered memories (recall_when) — declared 'recall in this situation'
         res = self._client.call_tool(
@@ -421,9 +560,10 @@ class PerseusVaultProvider(MemoryProvider):
                 items.append(it)
 
         if not items:
-            return ""
+            return _RecallResult("")
 
         lines = ["## Recalled from Perseus Vault (shared memory)"]
+        source_refs = []
         for it in items[: _PREFETCH_LIMIT + 2]:
             text = self._item_text(it)
             if not text:
@@ -431,9 +571,50 @@ class PerseusVaultProvider(MemoryProvider):
             cat = it.get("category", "")
             key = it.get("key", "")
             lines.append(f"- [{cat}/{key}] {text}")
+            source_refs.append(self._source_ref(it, text))
         if len(lines) == 1:
-            return ""
-        return "\n".join(lines)
+            return _RecallResult("")
+        return _RecallResult("\n".join(lines), tuple(source_refs))
+
+    @staticmethod
+    def _source_ref(item: Dict[str, Any], text: str) -> Tuple[str, str, str, str]:
+        """Return an in-memory source identity without retaining raw context."""
+        content_digest = str(
+            item.get("content_hash")
+            or item.get("digest")
+            or hashlib.sha256(text.encode("utf-8")).hexdigest()
+        )
+        return (
+            str(item.get("id") or ""),
+            str(item.get("category") or ""),
+            str(item.get("key") or ""),
+            content_digest,
+        )
+
+    @staticmethod
+    def _source_epoch_key(
+        source_ref: Tuple[str, str, str, str]
+    ) -> Tuple[str, str, str]:
+        source_id, category, key, content_digest = source_ref
+        if category or key:
+            return "category-key", category, key
+        return "identity", source_id, content_digest
+
+    def _invalidate_source_ref(
+        self, source_ref: Tuple[str, str, str, str]
+    ) -> None:
+        """Advance the local epoch for a source without retaining its body."""
+        with self._prefetch_lock:
+            key = self._source_epoch_key(source_ref)
+            self._source_epochs[key] = self._source_epochs.get(key, 0) + 1
+            self._prefetched = None
+
+    def _invalidate_source_key(self, category: str, key: str) -> None:
+        with self._prefetch_lock:
+            epoch_key = ("category-key", category, key)
+            self._source_epochs[epoch_key] = self._source_epochs.get(epoch_key, 0) + 1
+            if self._prefetched is not None:
+                self._prefetched = None
 
     def context_decision_projection(
         self,
@@ -558,12 +739,22 @@ class PerseusVaultProvider(MemoryProvider):
 
     def on_memory_write(self, action: str, target: str, content: str,
                         metadata: Optional[Dict[str, Any]] = None) -> None:
+        metadata = metadata or {}
+        if action == "remove":
+            # Invalidation is local and unconditional: even a disconnected
+            # provider must not retain a warm block after the host reports a
+            # committed built-in-memory removal.
+            self.invalidate_prefetch()
+            content = content or str(metadata.get("old_text") or "")
+        elif action in ("add", "replace"):
+            self.invalidate_prefetch()
         if not self._enabled or not self._client or not content:
             return
         digest = hashlib.sha1(content.encode()).hexdigest()[:8]
         category = "hermes-memory"
         key = f"builtin-{target}-{digest}"
         if action in ("add", "replace"):
+            self._invalidate_source_key(category, key)
             self._client.call_tool("perseus_vault_remember", {
                 "category": category,
                 "key": key,
@@ -576,11 +767,11 @@ class PerseusVaultProvider(MemoryProvider):
                 "tags": ["hermes", "builtin-memory", target],
             }, timeout=15)
         elif action == "remove":
+            self._invalidate_source_key(category, key)
             self._client.call_tool("perseus_vault_forget", {
                 "category": category, "key": key,
                 "reason": "removed from built-in memory",
             }, timeout=15)
-            self.invalidate_prefetch()
 
     # ------------------------------------------------------------------
     # Tools
@@ -592,8 +783,40 @@ class PerseusVaultProvider(MemoryProvider):
         # unconditionally. handle_tool_call() stays guarded by _enabled.
         return [REMEMBER_SCHEMA, RECALL_SCHEMA, FORGET_SCHEMA]
 
+    def lifecycle_capabilities(self) -> Dict[str, Any]:
+        """Report the provider's cache and deletion guarantees to the host."""
+        return {
+            "schema_version": LIFECYCLE_CONTROL_SCHEMA,
+            "addressed_forget": True,
+            "semantic_rejection": False,
+            "supersession": False,
+            "derived_artifact_invalidation": False,
+            "prefetch_invalidation": True,
+            "unsupported_behavior": "explicit_false_capability",
+        }
+
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any],
                          **kwargs) -> str:
+        if tool_name == "perseus_forget":
+            category = (args.get("category") or "").strip()
+            key = (args.get("key") or "").strip()
+            if not category or not key:
+                return json.dumps({"success": False, "error": "category and key required"})
+            # Invalidate before checking transport/calling Vault: a forget
+            # request must never leave a locally warm block consumable if the
+            # backend is already unavailable.
+            self.invalidate_prefetch()
+            self._invalidate_source_key(category, key)
+            if not self._enabled or not self._client:
+                return json.dumps({"success": False, "error": "perseus-vault not connected"})
+            ws_args = ({"workspace_hash": self._workspace_hash}
+                       if self._workspace_hash else {})
+            res = self._client.call_tool("perseus_vault_forget", {
+                "category": category, "key": key, **ws_args,
+            }, timeout=15)
+            return json.dumps({"success": res.get("ok", False),
+                               "result": res.get("text", "")[:400]})
+
         if not self._enabled or not self._client:
             return json.dumps({"success": False, "error": "perseus-vault not connected"})
 
@@ -645,18 +868,6 @@ class PerseusVaultProvider(MemoryProvider):
                     "text": self._item_text(it),
                 } for it in items],
             })
-
-        if tool_name == "perseus_forget":
-            category = (args.get("category") or "").strip()
-            key = (args.get("key") or "").strip()
-            if not category or not key:
-                return json.dumps({"success": False, "error": "category and key required"})
-            res = self._client.call_tool("perseus_vault_forget", {
-                "category": category, "key": key, **ws_args,
-            }, timeout=15)
-            self.invalidate_prefetch()
-            return json.dumps({"success": res.get("ok", False),
-                               "result": res.get("text", "")[:400]})
 
         return json.dumps({"success": False, "error": f"unknown tool {tool_name}"})
 
