@@ -460,6 +460,25 @@ class PrefetchLifecycleTests(unittest.TestCase):
 
         self.assertEqual(provider.prefetch("next query"), "")
 
+    def test_worker_queued_before_removal_cannot_publish_stale_source(self):
+        # Regression for the built-in removal race: a background worker queued
+        # before on_memory_write("remove", ...) must not be able to publish a
+        # block with a pre-removal source revision after the removal path has
+        # advanced the source revision/epochs (before the remote forget calls).
+        provider = self.provider()
+        provider._build_recall_block = Mock(
+            return_value=plugin._RecallResult("stale remove context")
+        )
+
+        with patch.object(plugin.threading, "Thread") as thread_class:
+            provider.queue_prefetch("query")
+            worker = thread_class.call_args.kwargs["target"]
+            provider.on_memory_write("remove", "MEMORY.md", "old content")
+            worker()
+
+        self.assertIsNone(provider._prefetched)
+        self.assertEqual(provider._source_revision, 1)
+
     def test_queued_prefetch_captures_generation_before_worker_starts(self):
         provider = self.provider()
         provider._build_recall_block = Mock(
