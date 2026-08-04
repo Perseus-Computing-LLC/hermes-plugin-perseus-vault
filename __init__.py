@@ -850,6 +850,8 @@ class PerseusVaultProvider(MemoryProvider):
                 "tags": ["hermes", "builtin-memory", target],
             }, timeout=15)
         elif action == "remove":
+            if not content:
+                return
             with self._prefetch_lock:
                 keys = list(self._builtin_source_keys.get(target, set()))
             for key in keys:
