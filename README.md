@@ -63,10 +63,11 @@ source from being returned by future provider prefetch. The provider cannot
 retract tokens already delivered to a model; the host must cancel or recover an
 already-composed turn according to its normal interruption policy.
 
-The lifecycle capability surface reports addressed forget and prefetch
-invalidation as supported. Semantic rejection, supersession, and derived
-artifact invalidation are explicitly reported as unsupported until the mounted
-Vault/provider contract supplies those operations.
+The lifecycle capability surface (`lifecycle_capabilities()`, a provider-local
+extension method) reports addressed forget and prefetch invalidation as
+supported. Semantic rejection, supersession, and derived artifact invalidation
+are explicitly reported as unsupported until the mounted Vault/provider
+contract supplies those operations.
 
 ## Configuration
 

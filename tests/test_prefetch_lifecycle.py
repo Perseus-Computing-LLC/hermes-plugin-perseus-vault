@@ -44,6 +44,7 @@ class PrefetchLifecycleTests(unittest.TestCase):
             generation=provider.prefetch_generation(),
             session_id=session_id,
             query_digest=plugin._evidence_digest(query),
+            source_revision=provider._source_revision,
         )
 
     def test_forget_invalidates_warmed_context_before_consumption(self):
@@ -60,6 +61,38 @@ class PrefetchLifecycleTests(unittest.TestCase):
         provider.invalidate_prefetch()
 
         provider.store_prefetched("stale context", generation=generation)
+
+        self.assertEqual(provider.prefetch("next query"), "")
+
+    def test_legacy_string_prefetch_remains_compatible(self):
+        provider = self.provider()
+        provider.store_prefetched(
+            "legacy context",
+            generation=provider.prefetch_generation(),
+        )
+
+        self.assertEqual(provider.prefetch("any query"), "legacy context")
+
+    def test_current_generation_result_from_before_source_mutation_is_rejected(self):
+        provider = self.provider()
+        source = ("source-1", "decision", "old", "digest")
+        with provider._prefetch_lock:
+            revision = provider._source_revision
+            epochs = (provider._source_epochs.get(
+                provider._source_epoch_key(source), 0
+            ),)
+
+        provider._invalidate_source_key("decision", "old")
+        provider.store_prefetched(
+            plugin._RecallResult(
+                "stale source context",
+                (source,),
+                revision,
+                epochs,
+            ),
+            generation=provider.prefetch_generation(),
+            query_digest=plugin._evidence_digest("next query"),
+        )
 
         self.assertEqual(provider.prefetch("next query"), "")
 
@@ -123,6 +156,7 @@ class PrefetchLifecycleTests(unittest.TestCase):
         provider.store_prefetched(
             plugin._RecallResult("forgotten source", (source,)),
             generation=provider.prefetch_generation(),
+            source_revision=provider._source_revision,
             query_digest=plugin._evidence_digest("next query"),
         )
         provider._enabled = False
@@ -326,10 +360,31 @@ class PrefetchLifecycleTests(unittest.TestCase):
         provider.store_prefetched(
             plugin._RecallResult("old source context", (source,)),
             generation=provider.prefetch_generation(),
+            source_revision=provider._source_revision,
             query_digest=plugin._evidence_digest("next query"),
         )
 
         provider._invalidate_source_key("hermes-memory", "builtin-MEMORY.md")
+
+        self.assertEqual(provider.prefetch("next query"), "")
+
+    def test_builtin_replace_invalidates_previous_digest_key(self):
+        provider = self.provider()
+        old_key = "builtin-MEMORY.md-old"
+        provider._builtin_source_keys["MEMORY.md"] = {old_key}
+        source = ("", "hermes-memory", old_key, "old-digest")
+        provider.store_prefetched(
+            plugin._RecallResult(
+                "old built-in context",
+                (source,),
+                provider._source_revision,
+                (0,),
+            ),
+            generation=provider.prefetch_generation(),
+            query_digest=plugin._evidence_digest("next query"),
+        )
+
+        provider.on_memory_write("replace", "MEMORY.md", "new content")
 
         self.assertEqual(provider.prefetch("next query"), "")
 
@@ -339,6 +394,7 @@ class PrefetchLifecycleTests(unittest.TestCase):
         provider.store_prefetched(
             plugin._RecallResult("old source context", (source,)),
             generation=provider.prefetch_generation(),
+            source_revision=provider._source_revision,
             query_digest=plugin._evidence_digest("next query"),
         )
 
@@ -349,6 +405,9 @@ class PrefetchLifecycleTests(unittest.TestCase):
     def test_empty_builtin_removal_uses_old_text_and_invalidates_warmed_context(self):
         provider = self.provider()
         self.store(provider, "removed context")
+        provider._builtin_source_keys.setdefault("MEMORY.md", set()).add(
+            "builtin-MEMORY.md-abc12345"
+        )
 
         provider.on_memory_write(
             "remove",
@@ -362,8 +421,7 @@ class PrefetchLifecycleTests(unittest.TestCase):
             [
                 call("perseus_vault_forget", {
                     "category": "hermes-memory",
-                    "key": "builtin-MEMORY.md-"
-                    + hashlib.sha1(b"old content").hexdigest()[:8],
+                    "key": "builtin-MEMORY.md-abc12345",
                     "reason": "removed from built-in memory",
                 }, timeout=15),
             ],
@@ -409,7 +467,33 @@ class PrefetchLifecycleTests(unittest.TestCase):
             provider.invalidate_prefetch()
             worker()
 
+        self.assertIsNone(provider._prefetched)
         self.assertEqual(provider.prefetch("query"), "")
+
+    def test_queued_prefetch_captures_source_revision_before_worker_starts(self):
+        provider = self.provider()
+        provider._build_recall_block = Mock(
+            side_effect=[
+                plugin._RecallResult("stale context"),
+                plugin._RecallResult(""),
+            ]
+        )
+
+        with patch.object(plugin.threading, "Thread") as thread_class:
+            provider.queue_prefetch("query")
+            worker = thread_class.call_args.kwargs["target"]
+            provider._invalidate_source_key("decision", "old")
+            worker()
+
+        self.assertIsNone(provider._prefetched)
+        self.assertEqual(provider.prefetch("query"), "")
+
+    def test_legacy_string_store_still_consumed_without_metadata(self):
+        provider = self.provider()
+
+        provider.store_prefetched("legacy block", generation=provider.prefetch_generation())
+
+        self.assertEqual(provider.prefetch("any query"), "legacy block")
 
     def test_warmed_context_is_returned_for_matching_query_and_session(self):
         provider = self.provider()
