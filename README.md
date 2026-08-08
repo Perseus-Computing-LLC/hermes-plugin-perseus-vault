@@ -71,8 +71,12 @@ contract supplies those operations.
 
 ## Configuration
 
-Resolution order: environment variables → `config.yaml` `memory.perseus-vault:`
-→ defaults.
+Resolution order: environment variables → `config.yaml`
+`memory.perseus-vault:` → the active `mcp_servers.perseus-vault.url` →
+defaults. The top-level MCP URL is a compatibility fallback so Hermes does
+not silently connect the memory provider to a different Vault deployment
+than the configured MCP server. Token resolution remains environment/config
+only; the provider never reads bearer tokens from `mcp_servers`.
 
 | Env var | Purpose | Default |
 |---|---|---|

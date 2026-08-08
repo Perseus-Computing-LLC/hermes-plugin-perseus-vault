@@ -5,7 +5,8 @@ FTS5 + dense semantic recall, correction tracking, decision journaling, and
 bi-temporal fact history. One Vault can be shared by many Hermes instances
 (Cloud, Desktop, cron workers) so context follows the user between machines.
 
-Config (env vars take precedence, then config.yaml under memory.perseus-vault:):
+Config resolution is env vars, then config.yaml under memory.perseus-vault:,
+then the active mcp_servers.perseus-vault URL for compatibility:
   PERSEUS_VAULT_MCP_TOKEN  — bearer token for the Vault MCP endpoint (required)
   PERSEUS_VAULT_URL        — MCP endpoint (default: https://vault.perseus.observer/message)
   PERSEUS_VAULT_WORKSPACE  — workspace scope hash (optional; blank = global)
@@ -291,6 +292,23 @@ class PerseusVaultProvider(MemoryProvider):
         except Exception:
             return {}
 
+    @staticmethod
+    def _mcp_server_section() -> Dict[str, Any]:
+        """Read the active Hermes MCP entry as a URL compatibility fallback.
+
+        Hermes supports both a memory-provider section and a top-level MCP
+        server registry. The provider owns token resolution, but reusing the
+        active server URL prevents the two configuration surfaces from
+        silently selecting different Vault deployments.
+        """
+        try:
+            from hermes_cli.config import cfg_get, load_config
+            config = load_config()
+            section = cfg_get(config, "mcp_servers", "perseus-vault")
+            return section if isinstance(section, dict) else {}
+        except Exception:
+            return {}
+
     @classmethod
     def _resolve(cls, env_var: str, key: str, default: str = "") -> str:
         val = os.environ.get(env_var, "").strip()
@@ -306,7 +324,16 @@ class PerseusVaultProvider(MemoryProvider):
 
     @classmethod
     def _url(cls) -> str:
-        return cls._resolve("PERSEUS_VAULT_URL", "url", _DEFAULT_URL)
+        val = os.environ.get("PERSEUS_VAULT_URL", "").strip()
+        if val:
+            return val
+        section = cls._config_section()
+        val = str(section.get("url", "") or "").strip()
+        if val:
+            return val
+        mcp_section = cls._mcp_server_section()
+        val = str(mcp_section.get("url", "") or "").strip()
+        return val or _DEFAULT_URL
 
     # ------------------------------------------------------------------
     # Core lifecycle
